@@ -121,9 +121,9 @@ $$\Psi(x,t) = \int \frac{dp}{2\pi\hbar}\,a(p)\,e^{\,i(px-\varepsilon_p t)/\hbar}
 
 ## План реализации
 
-- [ ] Создать репозиторий
-- [ ] Оформить README.md с физической постановкой
-- [ ] Установить Python, DeepXDE, TensorFlow/PyTorch
+- [x] Создать репозиторий
+- [x] Оформить README.md с физической постановкой
+- [x] Установить Python, DeepXDE, TensorFlow/PyTorch
 - [ ] Написать скелет `pinn_tdse.py`
 - [ ] Реализовать потенциал $V(x)$
 - [ ] Реализовать PDE для $u,v$
