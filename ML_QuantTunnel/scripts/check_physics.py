@@ -309,8 +309,8 @@ def test_configs():
         check(same, f"  поле '{key}' сохранилось без потерь")
 
     # --- Яма ---
-    well = sample_well_configs(500, rng)
-    check(len(well["U0"]) == 500, "яма: сгенерировано 500 конфигураций")
+    well = sample_well_configs(2000, rng)
+    check(len(well["U0"]) == 2000, "яма: сгенерировано 2000 конфигураций")
     for key in ("U0", "a", "eps", "b"):
         arr = well[key]
         check(arr.min() > 0.0,
