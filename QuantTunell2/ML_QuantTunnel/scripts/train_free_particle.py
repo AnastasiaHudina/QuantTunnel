@@ -14,6 +14,19 @@
 ------
     DDE_BACKEND=pytorch python scripts/train_free_particle.py [--iterations N]
 
+Дообучение с чекпоинта (вместо обучения с нуля) + доводка L-BFGS:
+
+    DDE_BACKEND=pytorch python scripts/train_free_particle.py \
+        --resume checkpoints/pinn_free-8000.pt --iterations 0 --lbfgs_maxiter 1500
+
+Дообучение с явным штрафом за сохранение нормы поверх уже обученных весов
+(веса берутся без состояния оптимизатора -- оно всё равно не актуально для
+новой функции потерь):
+
+    DDE_BACKEND=pytorch python scripts/train_free_particle.py \
+        --init_weights checkpoints/pinn_free-8850.pt --iterations 0 \
+        --lbfgs_maxiter 3000 --norm_penalty --norm_penalty_weight 100
+
 Источник аналитических формул: [2], стр. 117-119, задача 4.2, формулы (4), (5).
 """
 
@@ -31,9 +44,11 @@ import numpy as np
 # обе версии NumPy.
 _trapz = getattr(np, "trapezoid", np.trapz)
 
+import deepxde as dde
+
 from physics.constants import h_planck, m
 from physics.initial_condition import k0_from_energy
-from model.pinn_free import build_model, compile_model, X0, B, EPS, L, T
+from model.pinn_free import build_model, compile_model, load_net_weights, X0, B, EPS, L, T
 
 
 def header(title):
@@ -107,28 +122,120 @@ def evaluate(model, t_values, nx=4000):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--iterations", type=int, default=5000)
+    parser.add_argument("--iterations", type=int, default=5000,
+                         help="Итераций Adam. 0 -- пропустить фазу Adam "
+                              "(используется вместе с --resume + --lbfgs_maxiter).")
     parser.add_argument("--num_domain", type=int, default=4000)
     parser.add_argument("--num_boundary", type=int, default=400)
     parser.add_argument("--num_initial", type=int, default=400)
+    parser.add_argument("--resume", type=str, default=None,
+                         help="Путь к чекпоинту (.pt), с которого продолжить "
+                              "обучение вместо случайной инициализации.")
+    parser.add_argument("--resume_optimizer", choices=["adam", "L-BFGS"], default="adam",
+                         help="Каким оптимизатором был СОХРАНЁН чекпоинт в "
+                              "--resume. DeepXDE сохраняет состояние "
+                              "оптимизатора вместе с весами, и model.restore() "
+                              "падает с KeyError, если на момент restore "
+                              "скомпилирован оптимизатор другого типа — "
+                              "поэтому перед restore нужно скомпилировать "
+                              "именно тот оптимизатор, с которым был сохранён "
+                              "чекпоинт (adam для обычного обучения с нуля, "
+                              "L-BFGS -- если чекпоинт сам получен доводкой "
+                              "L-BFGS, как pinn_free-3000.pt после первого "
+                              "раунда доводки).")
+    parser.add_argument("--lbfgs_maxiter", type=int, default=0,
+                         help="Если > 0, после Adam запускается (или "
+                              "продолжается) доводка L-BFGS с этим "
+                              "ограничением на число итераций (L-BFGS обычно "
+                              "даёт заметно более точную сходимость, чем "
+                              "чистый Adam, но дороже по времени на итерацию).")
+    parser.add_argument("--init_weights", type=str, default=None,
+                         help="Путь к чекпоинту (.pt), откуда взять ТОЛЬКО "
+                              "веса сети (без состояния оптимизатора) -- "
+                              "аналог --resume, но без ограничения на тип "
+                              "оптимизатора и без переноса его состояния "
+                              "(полезно, когда меняется сама функция "
+                              "потерь, например, включается "
+                              "--norm_penalty, и состояние старого "
+                              "оптимизатора всё равно не актуально).")
+    parser.add_argument("--norm_penalty", action="store_true",
+                         help="Добавить мягкое ограничение на сохранение "
+                              "нормы ∫|Ψ|²dx=1 на нескольких срезах t "
+                              "(см. model.pinn_free.build_norm_penalty_bc).")
+    parser.add_argument("--norm_penalty_weight", type=float, default=100.0)
+    parser.add_argument("--norm_penalty_slices", type=int, default=8)
+    parser.add_argument("--norm_penalty_nx", type=int, default=400)
     args = parser.parse_args()
 
     header("ОБУЧЕНИЕ PINN: СВОБОДНОЕ ДВИЖЕНИЕ (V=0)")
     print(f"Конфигурация: x0={X0}, b={B}, eps={EPS}, L={L}, T={T}")
     print(f"Точки коллокации: domain={args.num_domain}, "
           f"boundary={args.num_boundary}, initial={args.num_initial}")
-    print(f"Итераций Adam: {args.iterations}")
+    if args.norm_penalty:
+        print(f"Штраф за норму: включён (weight={args.norm_penalty_weight}, "
+              f"slices={args.norm_penalty_slices}, nx={args.norm_penalty_nx})")
 
     model = build_model(
         num_domain=args.num_domain,
         num_boundary=args.num_boundary,
         num_initial=args.num_initial,
+        norm_penalty=args.norm_penalty,
+        norm_penalty_slices=args.norm_penalty_slices,
+        norm_penalty_nx=args.norm_penalty_nx,
     )
-    compile_model(model, lr=1e-3)
 
-    losshistory, train_state = model.train(
-        iterations=args.iterations, display_every=max(args.iterations // 10, 1)
-    )
+    # current_optimizer отслеживает, какой оптимизатор РЕАЛЬНО сейчас
+    # скомпилирован в model, чтобы не перекомпилировать (и тем самым не
+    # сбрасывать восстановленное состояние оптимизатора) без необходимости.
+    current_optimizer = None
+
+    def compile_for(optimizer, lr=1e-3, maxiter=None):
+        nonlocal current_optimizer
+        if optimizer == "L-BFGS" and maxiter is not None:
+            dde.optimizers.config.set_LBFGS_options(maxiter=maxiter)
+        compile_model(model, optimizer=optimizer, lr=lr,
+                      norm_penalty=args.norm_penalty,
+                      norm_penalty_weight=args.norm_penalty_weight)
+        current_optimizer = optimizer
+
+    if args.init_weights:
+        # Веса без состояния оптимизатора: компилируем adam со свежим
+        # (нулевым) состоянием и просто подставляем веса сети поверх --
+        # restore-совместимость оптимизатора тут не нужна и не используется.
+        compile_for("adam", lr=1e-3)
+        print(f"Загружаем веса сети (без оптимизатора) из: {args.init_weights}")
+        load_net_weights(model, args.init_weights)
+    elif args.resume:
+        # Компилируем ТОТ оптимизатор, которым чекпоинт был сохранён --
+        # иначе model.restore() падает с KeyError на optimizer_state_dict.
+        compile_for(args.resume_optimizer, lr=1e-3,
+                    maxiter=args.lbfgs_maxiter if args.resume_optimizer == "L-BFGS" else None)
+        print(f"Восстанавливаем веса из чекпоинта: {args.resume} "
+              f"(оптимизатор: {args.resume_optimizer})")
+        model.restore(args.resume, verbose=1)
+    else:
+        compile_for("adam", lr=1e-3)
+
+    losshistory = None
+
+    if args.iterations > 0:
+        if current_optimizer != "adam":
+            compile_for("adam", lr=1e-3)
+        print(f"Итераций Adam: {args.iterations}")
+        losshistory, _ = model.train(
+            iterations=args.iterations, display_every=max(args.iterations // 10, 1)
+        )
+    else:
+        print("Фаза Adam пропущена (--iterations 0).")
+
+    if args.lbfgs_maxiter > 0:
+        header(f"ДОВОДКА L-BFGS (maxiter={args.lbfgs_maxiter})")
+        # Перекомпилируем L-BFGS, только если он ещё не скомпилирован с
+        # нужным maxiter (т.е. не был только что восстановлен как раз для
+        # этого) -- иначе теряем restore-нутое состояние оптимизатора зря.
+        if current_optimizer != "L-BFGS" or args.iterations > 0:
+            compile_for("L-BFGS", maxiter=args.lbfgs_maxiter)
+        losshistory, _ = model.train(display_every=max(args.lbfgs_maxiter // 10, 1))
 
     header("ПРОВЕРКА: ТЕСТ 1 (СВОБОДНОЕ ДВИЖЕНИЕ)")
     t_values = np.linspace(0.0, T, 6)
