@@ -209,7 +209,14 @@ def check_norm(x, x0, b, eps):
         Значение интеграла ∫ |ψ|² dx.
     """
     psi = psi_initial(x, x0, b, eps)
-    return np.trapezoid(np.abs(psi) ** 2, x)
+    integrand = np.abs(psi) ** 2
+
+    # Безопасный fallback для разных версий NumPy:
+    # np.trapezoid появился в NumPy 2.0, до этого функция называлась np.trapz
+    try:
+        return np.trapezoid(integrand, x)  # NumPy 2.0+
+    except AttributeError:
+        return np.trapz(integrand, x)  # NumPy < 2.0
 
     #trapezoid - это численное интегрирование методом трапеций.
     #Первый аргумент — массив значений подынтегральной функции, второй — сетка по x.
