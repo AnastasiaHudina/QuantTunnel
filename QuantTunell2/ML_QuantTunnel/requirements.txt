@@ -1,0 +1,15 @@
+numpy
+scipy
+deepxde
+torch
+
+# DeepXDE поддерживает несколько бэкендов (TensorFlow, PyTorch, JAX, Paddle).
+# В этом проекте используется PyTorch, т.к. он не требует отдельной установки
+# TensorFlow. Перед запуском любого скрипта из model/ или scripts/ нужно
+# задать переменную окружения:
+#
+#   Windows (PowerShell):  $env:DDE_BACKEND = "pytorch"
+#   Linux/macOS:            export DDE_BACKEND=pytorch
+#
+# либо один раз прописать backend в ~/.deepxde/config.json (см. документацию
+# DeepXDE: https://deepxde.readthedocs.io/en/latest/user/installation.html).
