@@ -39,18 +39,14 @@ except AttributeError:
 
 def D_packet_numeric(EPS, b, U0, a, n_pts=4000, n_sigma=4.0):
     """
-    Усреднённый по спектру гауссова пакета коэффициент прохождения:
+    Усреднённый по спектру гауссова пакета коэффициент прохождения.
 
-        D_packet = ∫ |a(p)|² D_well(p²/2m, U0, a) dp / ∫ |a(p)|² dp
-
-    где |a(p)|² -- гауссово распределение по импульсу с центром
-    p0 = sqrt(2m·EPS) и шириной sigma_p = ħ / (sqrt(2)·b).
-
-    Почему это нужно: формула D_well даёт D = 1 только для
-    МОНОХРОМАТИЧЕСКОЙ волны точно на резонансе. Пакет конечной ширины
-    b имеет разброс по энергии, и часть спектра попадает мимо
-    резонанса. D_packet -- реалистичная цель для PINN на пакете,
-    в отличие от идеализированной D_well = 1.
+    ВАЖНО: для компонент с p < 0 (летящих влево, прочь от ямы) вклад
+    в прошедшую часть равен нулю -- они физически не могут оказаться
+    справа от ямы. Формула D_well(eps) для них неверна, потому что
+    она описывает рассеяние слева-направо. Поэтому D_arr маскируется
+    нулём при p <= 0. Поправка мала (~0.8% веса пакета при b=1), но
+    делает D_packet физически корректным.
     """
     p0 = np.sqrt(2.0 * m * EPS)
     sigma_p = h_planck / (np.sqrt(2.0) * b)
@@ -61,15 +57,19 @@ def D_packet_numeric(EPS, b, U0, a, n_pts=4000, n_sigma=4.0):
     )
     weight = np.exp(-0.5 * ((p_arr - p0) / sigma_p) ** 2)
     eps_arr = p_arr ** 2 / (2.0 * m)
-    D_arr = D_well(eps_arr, U0, a)
+
+    D_arr = np.where(
+        p_arr > 0.0,
+        D_well(eps_arr, U0, a),
+        0.0,
+    )
+
     num = _trapz(weight * D_arr, p_arr)
     den = _trapz(weight, p_arr)
     return num / den
 
 
 class TqdmCallback(dde.callbacks.Callback):
-    """Прогресс-бар tqdm, обновляемый на каждой итерации."""
-
     def __init__(self, total, desc="train"):
         super().__init__()
         self.total = total
@@ -79,11 +79,8 @@ class TqdmCallback(dde.callbacks.Callback):
     def on_train_begin(self):
         if HAS_TQDM:
             self.pbar = tqdm(
-                total=self.total,
-                desc=self.desc,
-                unit="it",
-                leave=True,
-                dynamic_ncols=True,
+                total=self.total, desc=self.desc, unit="it",
+                leave=True, dynamic_ncols=True,
             )
 
     def on_epoch_end(self):
@@ -96,19 +93,39 @@ class TqdmCallback(dde.callbacks.Callback):
             self.pbar = None
 
 
-def train_with_bar(model, total, desc, display_every, optimizer_type):
-    cb = TqdmCallback(total, desc)
+def set_lbfgs(maxiter, maxls=None):
+    """
+    maxls ограничивает число line-search шагов на одну L-BFGS-итерацию.
+    Без него на плоской функции каждая "итерация" делает 100-200
+    function evals, и обучение растягивается на дни.
+    """
+    if maxls is not None:
+        try:
+            dde.optimizers.config.set_LBFGS_options(
+                maxiter=maxiter, maxls=maxls
+            )
+            return
+        except TypeError:
+            pass
+    dde.optimizers.config.set_LBFGS_options(maxiter=maxiter)
+
+
+def train_with_bar(model, total, desc, display_every, optimizer_type,
+                   ckpt_cb=None):
+    cb_list = [TqdmCallback(total, desc)]
+    if ckpt_cb is not None:
+        cb_list.append(ckpt_cb)
     t0 = time.time()
 
     if optimizer_type == "adam":
         model.train(
             iterations=total,
-            callbacks=[cb],
+            callbacks=cb_list,
             display_every=display_every,
         )
     else:
         model.train(
-            callbacks=[cb],
+            callbacks=cb_list,
             display_every=display_every,
         )
 
@@ -131,34 +148,48 @@ def main():
               "Установить: pip install tqdm")
     print()
 
-    model = build_model(
-        norm_penalty=True,
-        norm_penalty_slices=8,
-        norm_penalty_nx=1000,
+    # ==================================================================
+    # ФАЗЫ 1-2: модель БЕЗ norm_penalty (быстро).
+    # ==================================================================
+    print("Собираем модель без norm_penalty (фазы 1-2)...")
+    model_plain = build_model(
+        num_domain=2000,
+        num_boundary=400,
+        num_initial=400,
     )
 
-    # ---------- ФАЗА 1: Adam, норма выключена ----------
-    print("=== ФАЗА 1: Adam без штрафа за норму (5000 итераций) ===")
-    compile_model(model, "adam", lr=1e-3,
-                  norm_penalty=True, norm_penalty_weight=0.0)
-    train_with_bar(model, total=5000, desc="Фаза 1 (Adam)",
+    print("\n=== ФАЗА 1: Adam (5000 итераций) ===")
+    compile_model(model_plain, "adam", lr=1e-3, norm_penalty=False)
+    train_with_bar(model_plain, total=5000, desc="Фаза 1 (Adam)",
                    display_every=500, optimizer_type="adam")
 
-    # ---------- ФАЗА 2: L-BFGS, норма выключена ----------
-    print("\n=== ФАЗА 2: L-BFGS без штрафа за норму (5000 итераций) ===")
-    dde.optimizers.config.set_LBFGS_options(maxiter=5000)
-    compile_model(model, "L-BFGS",
-                  norm_penalty=True, norm_penalty_weight=0.0)
-    train_with_bar(model, total=5000, desc="Фаза 2 (L-BFGS)",
-                   display_every=500, optimizer_type="lbfgs")
+    print("\n=== ФАЗА 2: L-BFGS (500 итераций, maxls=15) ===")
+    set_lbfgs(maxiter=500, maxls=15)
+    compile_model(model_plain, "L-BFGS", norm_penalty=False)
+    train_with_bar(model_plain, total=500, desc="Фаза 2 (L-BFGS)",
+                   display_every=50, optimizer_type="lbfgs")
 
-    # ---------- ФАЗА 3: L-BFGS, норма включена ----------
-    print("\n=== ФАЗА 3: L-BFGS со штрафом за норму (500 итераций) ===")
-    dde.optimizers.config.set_LBFGS_options(maxiter=500)
+    # ==================================================================
+    # ФАЗА 3: модель С norm_penalty, веса переносим из model_plain.
+    # ==================================================================
+    print("\nСобираем модель С norm_penalty (фаза 3)...")
+    model = build_model(
+        num_domain=2000,
+        num_boundary=400,
+        num_initial=400,
+        norm_penalty=True,
+        norm_penalty_slices=4,
+        norm_penalty_nx=400,
+    )
+    model.net.load_state_dict(model_plain.net.state_dict())
+    print("Веса перенесены из model_plain в model_norm.")
+
+    print("\n=== ФАЗА 3: L-BFGS со штрафом за норму (150 итераций) ===")
+    set_lbfgs(maxiter=150, maxls=15)
     compile_model(model, "L-BFGS",
                   norm_penalty=True, norm_penalty_weight=100.0)
-    train_with_bar(model, total=500, desc="Фаза 3 (L-BFGS)",
-                   display_every=50, optimizer_type="lbfgs")
+    train_with_bar(model, total=150, desc="Фаза 3 (L-BFGS+norm)",
+                   display_every=25, optimizer_type="lbfgs")
 
     save_path = str(checkpoints_dir / "pinn_well")
     model.save(save_path)
@@ -172,15 +203,13 @@ def main():
     print("РЕЗУЛЬТАТЫ: ТЕСТ 4")
     print("=" * 70)
 
-    # Три ориентира:
-    #   D_well(EPS)         -- точечный предел (1 на резонансе), справочно;
-    #   D_packet_numeric    -- реалистичная цель для пакета ширины b;
-    #   D_PINN              -- из модели.
     D_well_point = D_well(EPS, U0_WELL, WELL_HALFWIDTH)
     D_packet = D_packet_numeric(EPS, B, U0_WELL, WELL_HALFWIDTH)
 
-    print(f"\nD_well(ε={EPS:.4f}) = {D_well_point:.6f}  (точечный предел, справочно)")
-    print(f"D_packet (пакет b={B})  = {D_packet:.6f}  (реалистичная цель)")
+    print(f"\nD_well(ε={EPS:.4f}) = {D_well_point:.6f}  "
+          f"(точечный предел, справочно)")
+    print(f"D_packet (пакет b={B})  = {D_packet:.6f}  "
+          f"(реалистичная цель)")
     print()
 
     x_test = np.linspace(-L, L, 4000)
@@ -200,7 +229,7 @@ def main():
         f"- `D_well(ε)` = {D_well_point:.6f}  "
         f"(точечный предел, справочно)",
         f"- `D_packet` = {D_packet:.6f}  "
-        f"(пакет b={B}, реалистичная цель)",
+        f"(пакет b={B}, реалистичная цель, p<0 исключены)",
         "",
         header,
         sep,
@@ -223,7 +252,6 @@ def main():
         print(row)
         md_lines.append(row)
 
-    # ---------- Итог при t = T ----------
     X_T = np.column_stack([x_test, np.full_like(x_test, T)])
     y_T = model.predict(X_T)
     prob_T = y_T[:, 0] ** 2 + y_T[:, 1] ** 2
@@ -233,7 +261,7 @@ def main():
     norm_dev = abs(norm_T - 1.0)
     d_T_err = abs(D_T - D_packet)
     ok_norm = norm_dev < 1e-3
-    ok_D = d_T_err < 0.10   # 10% -- см. комментарий про конечную ширину пакета
+    ok_D = d_T_err < 0.10
     passed = ok_norm and ok_D
 
     print()
@@ -253,8 +281,7 @@ def main():
         f"{'OK' if ok_norm else 'FAIL'}",
         f"- `|D_PINN - D_packet| = {d_T_err:.4f}` (критерий: < 0.10) — "
         f"{'OK' if ok_D else 'FAIL'}",
-        f"- `|D_PINN - 1| = {abs(D_T - 1.0):.4f}` (справочно: пакет "
-        f"конечной ширины не проходит 100% даже в идеале)",
+        f"- `|D_PINN - 1| = {abs(D_T - 1.0):.4f}` (справочно)",
         "",
         f"**РЕЗУЛЬТАТ: {'ПРОЙДЕН' if passed else 'НЕ ПРОЙДЕН'}**",
     ]

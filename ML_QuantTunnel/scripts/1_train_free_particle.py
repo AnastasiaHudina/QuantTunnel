@@ -125,7 +125,7 @@ def evaluate(model, t_values, nx=4000):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--iterations", type=int, default=5000,
+    parser.add_argument("--iterations", type=int, default=8000,
                          help="Итераций Adam. 0 -- пропустить фазу Adam "
                               "(используется вместе с --resume + --lbfgs_maxiter).")
     parser.add_argument("--num_domain", type=int, default=4000)

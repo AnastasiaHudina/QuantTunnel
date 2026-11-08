@@ -37,10 +37,6 @@ except AttributeError:
 
 
 class TqdmCallback(dde.callbacks.Callback):
-    """
-    Прогресс-бар tqdm, обновляемый на каждой итерации обучения.
-    """
-
     def __init__(self, total, desc="train"):
         super().__init__()
         self.total = total
@@ -50,11 +46,8 @@ class TqdmCallback(dde.callbacks.Callback):
     def on_train_begin(self):
         if HAS_TQDM:
             self.pbar = tqdm(
-                total=self.total,
-                desc=self.desc,
-                unit="it",
-                leave=True,
-                dynamic_ncols=True,
+                total=self.total, desc=self.desc, unit="it",
+                leave=True, dynamic_ncols=True,
             )
 
     def on_epoch_end(self):
@@ -67,19 +60,46 @@ class TqdmCallback(dde.callbacks.Callback):
             self.pbar = None
 
 
-def train_with_bar(model, total, desc, display_every, optimizer_type):
-    cb = TqdmCallback(total, desc)
+def set_lbfgs(maxiter, maxls=None):
+    """
+    Обёртка над set_LBFGS_options.
+
+    maxls -- максимум шагов line search на одну итерацию L-BFGS.
+    Без этого ограничения на плоской функции line search уходит в
+    разнос: каждая "итерация" делает сотни function evals, обучение
+    растягивается на дни. maxls=15-20 -- разумный компромисс между
+    качеством и скоростью.
+
+    Старые версии DeepXDE могут не принимать maxls -- фолбэк на
+    вариант без него.
+    """
+    if maxls is not None:
+        try:
+            dde.optimizers.config.set_LBFGS_options(
+                maxiter=maxiter, maxls=maxls
+            )
+            return
+        except TypeError:
+            pass
+    dde.optimizers.config.set_LBFGS_options(maxiter=maxiter)
+
+
+def train_with_bar(model, total, desc, display_every, optimizer_type,
+                   ckpt_cb=None):
+    cb_list = [TqdmCallback(total, desc)]
+    if ckpt_cb is not None:
+        cb_list.append(ckpt_cb)
     t0 = time.time()
 
     if optimizer_type == "adam":
         model.train(
             iterations=total,
-            callbacks=[cb],
+            callbacks=cb_list,
             display_every=display_every,
         )
     else:  # L-BFGS
         model.train(
-            callbacks=[cb],
+            callbacks=cb_list,
             display_every=display_every,
         )
 
@@ -102,41 +122,75 @@ def main():
               "Установить: pip install tqdm")
     print()
 
-    model = build_model(
-        norm_penalty=True,
-        norm_penalty_slices=8,
-        norm_penalty_nx=800,
+    # ==================================================================
+    # ФАЗЫ 1-2: модель БЕЗ norm_penalty.
+    #
+    # Зачем отдельная модель: при norm_penalty=False в data.TimePDE
+    # НЕ добавляется PointSetOperatorBC с 6400 точками нормировочной
+    # сетки. Эти точки всё равно вычисляются на каждом forward, даже
+    # если вес нормы 0, -- просто как часть списка потерь. Убирая их
+    # из фаз 1-2, получаем ~2x ускорение.
+    #
+    # num_domain=2000 (вместо 4000) -- ещё ~1.5x. На точность для
+    # этого теста не влияет заметно: внутри барьера всё равно ~25
+    # точек коллокации, этого с избытком.
+    # ==================================================================
+    print("Собираем модель без norm_penalty (фазы 1-2)...")
+    model_plain = build_model(
+        num_domain=2000,
+        num_boundary=400,
+        num_initial=400,
     )
 
-    # ---------- ФАЗА 1: Adam, норма выключена ----------
-    print("=== ФАЗА 1: Adam без штрафа за норму (5000 итераций) ===")
-    compile_model(model, "adam", lr=1e-3,
-                  norm_penalty=True, norm_penalty_weight=0.0)
-    train_with_bar(model, total=5000, desc="Фаза 1 (Adam)",
+    # ---------- ФАЗА 1: Adam ----------
+    print("\n=== ФАЗА 1: Adam (5000 итераций) ===")
+    compile_model(model_plain, "adam", lr=1e-3, norm_penalty=False)
+    train_with_bar(model_plain, total=5000, desc="Фаза 1 (Adam)",
                    display_every=500, optimizer_type="adam")
 
-    # ---------- ФАЗА 2: L-BFGS, норма выключена ----------
-    print("\n=== ФАЗА 2: L-BFGS без штрафа за норму (5000 итераций) ===")
-    dde.optimizers.config.set_LBFGS_options(maxiter=5000)
-    compile_model(model, "L-BFGS",
-                  norm_penalty=True, norm_penalty_weight=0.0)
-    train_with_bar(model, total=5000, desc="Фаза 2 (L-BFGS)",
-                   display_every=500, optimizer_type="lbfgs")
+    # ---------- ФАЗА 2: L-BFGS с ограниченным line search ----------
+    print("\n=== ФАЗА 2: L-BFGS (500 итераций, maxls=15) ===")
+    set_lbfgs(maxiter=500, maxls=15)
+    compile_model(model_plain, "L-BFGS", norm_penalty=False)
+    train_with_bar(model_plain, total=500, desc="Фаза 2 (L-BFGS)",
+                   display_every=50, optimizer_type="lbfgs")
 
-    # ---------- ФАЗА 3: L-BFGS, норма включена ----------
-    print("\n=== ФАЗА 3: L-BFGS со штрафом за норму (500 итераций) ===")
-    dde.optimizers.config.set_LBFGS_options(maxiter=500)
+    # ==================================================================
+    # ФАЗА 3: модель С norm_penalty.
+    #
+    # Собираем заново, веса переносим из model_plain через
+    # load_state_dict. Архитектура сети одна и та же (FNN [2]+[50]*5+[2]),
+    # поэтому ключи state_dict совпадают.
+    #
+    # norm_penalty_nx=400, norm_penalty_slices=4 -- вместо 800/8.
+    # На таком разрешении штраф за норму уже эффективно работает,
+    # а стоит в 4 раза дешевле.
+    # ==================================================================
+    print("\nСобираем модель С norm_penalty (фаза 3)...")
+    model = build_model(
+        num_domain=2000,
+        num_boundary=400,
+        num_initial=400,
+        norm_penalty=True,
+        norm_penalty_slices=4,
+        norm_penalty_nx=400,
+    )
+    model.net.load_state_dict(model_plain.net.state_dict())
+    print("Веса перенесены из model_plain в model_norm.")
+
+    print("\n=== ФАЗА 3: L-BFGS со штрафом за норму (150 итераций) ===")
+    set_lbfgs(maxiter=150, maxls=15)
     compile_model(model, "L-BFGS",
                   norm_penalty=True, norm_penalty_weight=100.0)
-    train_with_bar(model, total=500, desc="Фаза 3 (L-BFGS)",
-                   display_every=50, optimizer_type="lbfgs")
+    train_with_bar(model, total=150, desc="Фаза 3 (L-BFGS+norm)",
+                   display_every=25, optimizer_type="lbfgs")
 
     save_path = str(checkpoints_dir / "pinn_barrier_above")
     model.save(save_path)
     print(f"\nМодель сохранена: {save_path}-*.pt")
 
     # ==================================================================
-    # ОЦЕНКА: таблица как в тесте 2, но с аналитикой для ε > W
+    # ОЦЕНКА
     # ==================================================================
     print()
     print("=" * 70)
@@ -179,7 +233,6 @@ def main():
         print(row)
         md_lines.append(row)
 
-    # ---------- Итог при t = T ----------
     X_T = np.column_stack([x_test, np.full_like(x_test, T)])
     y_T = model.predict(X_T)
     prob_T = y_T[:, 0] ** 2 + y_T[:, 1] ** 2

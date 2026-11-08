@@ -1,14 +1,9 @@
 # scripts/check_norm_all.py
 """
-Тест 5: сохранение нормы ∫|Ψ(x,t)|²dx = 1 во всех моделях.
+Тест 5: сохранение нормы ∫|Ψ(x,t)|²dx = 1 во всех обученных моделях.
 
-Загружает чекпоинты всех обученных моделей (свободное движение,
-туннелирование, надбарьерное, яма) и строит единую таблицу нормы
-по времени. Тест считается пройденным для модели, если max_t |norm−1|
-< 1e-3.
-
-Это агрегатор: сами модели проверялись в своих train_*.py, здесь мы
-только собираем результаты в одно место для отчёта.
+Агрегатор: сами модели обучались и проверялись в train_*.py, здесь
+только собираем результаты по норме в один отчёт.
 """
 import os
 
@@ -26,18 +21,11 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from physics.constants import h_planck, m
-
 try:
     _trapz = np.trapezoid
 except AttributeError:
     _trapz = np.trapz
 
-
-# ---------------------------------------------------------------------------
-# Реестр моделей: имя, модуль сборки, чекпоинт, L, T, x0, b, eps.
-# Для каждой модели параметры совпадают с train_*.py.
-# ---------------------------------------------------------------------------
 
 def _latest_checkpoint(pattern):
     files = sorted(
@@ -47,67 +35,40 @@ def _latest_checkpoint(pattern):
     return files[-1] if files else None
 
 
+def _try_add(entries, name, module_name, ckpt_pattern):
+    """Пытается добавить модель в реестр. Возвращает True, если добавил."""
+    try:
+        mod = __import__(module_name, fromlist=["build_model"])
+    except ImportError as e:
+        print(f"[skip] {name}: модуль {module_name} не найден ({e})")
+        return False
+
+    ckpt = _latest_checkpoint(ckpt_pattern)
+    if ckpt is None:
+        print(f"[skip] {name}: нет чекпоинта {ckpt_pattern}")
+        return False
+
+    entries.append((
+        name,
+        mod.build_model,
+        mod.compile_model,
+        ckpt,
+        mod.L,
+        mod.T,
+    ))
+    return True
+
+
 def _make_models():
-    """
-    Возвращает список кортежей:
-        (name, build_fn, compile_fn, checkpoint_path, L, T)
-    Импорты делаются внутри, чтобы не тянуть все модели, если
-    какая-то ещё не обучена.
-    """
     entries = []
-
-    # --- Тест 1: свободное движение (pinn_free) ---
-    try:
-        from model.pinn_free import (
-            build_model as b1, compile_model as c1,
-            L as L1, T as T1,
-        )
-        ckpt = _latest_checkpoint("pinn_free-*.pt")
-        if ckpt:
-            entries.append(("Тест 1: свободное движение",
-                            b1, c1, ckpt, L1, T1))
-    except ImportError:
-        pass
-
-    # --- Тест 2: туннелирование ---
-    try:
-        from model.pinn_barrier import (
-            build_model as b2, compile_model as c2,
-            L as L2, T as T2,
-        )
-        ckpt = _latest_checkpoint("pinn_barrier-*.pt")
-        if ckpt:
-            entries.append(("Тест 2: туннелирование",
-                            b2, c2, ckpt, L2, T2))
-    except ImportError:
-        pass
-
-    # --- Тест 3: надбарьерное ---
-    try:
-        from model.pinn_barrier_above import (
-            build_model as b3, compile_model as c3,
-            L as L3, T as T3,
-        )
-        ckpt = _latest_checkpoint("pinn_barrier_above-*.pt")
-        if ckpt:
-            entries.append(("Тест 3: надбарьерное",
-                            b3, c3, ckpt, L3, T3))
-    except ImportError:
-        pass
-
-    # --- Тест 4: яма ---
-    try:
-        from model.pinn_well import (
-            build_model as b4, compile_model as c4,
-            L as L4, T as T4,
-        )
-        ckpt = _latest_checkpoint("pinn_well-*.pt")
-        if ckpt:
-            entries.append(("Тест 4: резонанс в яме",
-                            b4, c4, ckpt, L4, T4))
-    except ImportError:
-        pass
-
+    _try_add(entries, "Тест 1: свободное движение",
+             "model.pinn_free", "pinn_free-*.pt")
+    _try_add(entries, "Тест 2: туннелирование",
+             "model.pinn_barrier", "pinn_barrier-*.pt")
+    _try_add(entries, "Тест 3: надбарьерное",
+             "model.pinn_barrier_above", "pinn_barrier_above-*.pt")
+    _try_add(entries, "Тест 4: резонанс в яме",
+             "model.pinn_well", "pinn_well-*.pt")
     return entries
 
 
@@ -117,7 +78,6 @@ def _load_weights(model, path):
 
 
 def norm_at(model, t, L, n_pts=4000):
-    """Возвращает ∫|Ψ(x,t)|²dx на [-L, L]."""
     x = np.linspace(-L, L, n_pts)
     X = np.column_stack([x, np.full_like(x, t)])
     y = model.predict(X)
@@ -125,45 +85,44 @@ def norm_at(model, t, L, n_pts=4000):
     return _trapz(prob, x)
 
 
+def _build_and_compile(build_fn, compile_fn):
+    """
+    Собирает модель и компилирует adam. Пробуем norm_penalty=True,
+    фолбэк -- без него (на случай старых сигнатур).
+    """
+    try:
+        model = build_fn(norm_penalty=True)
+        compile_fn(model, "adam", norm_penalty=True)
+        return model
+    except TypeError:
+        model = build_fn()
+        compile_fn(model, "adam")
+        return model
+
+
 def main():
     entries = _make_models()
     if not entries:
         raise RuntimeError(
             "Не найдено ни одного чекпоинта. Сначала запустите "
-            "train_free_particle.py / train_barrier.py / "
-            "train_barrier_above.py / train_well.py"
+            "соответствующие train_*.py."
         )
 
-    # Срезов по t берём 11 -- достаточно, чтобы увидеть тренд.
     n_t = 11
 
     md_lines = [
         "# Тест 5: сохранение нормы во всех моделях\n",
         "Критерий: `max_t |∫|Ψ|²dx − 1| < 1e-3`.\n",
+        f"Проверено моделей: {len(entries)}.\n",
     ]
 
     results = []  # (name, max_dev, passed, ts, norms)
 
     for name, build_fn, compile_fn, ckpt, L, T in entries:
         print(f"\n=== {name} ===")
-        print(f"  чекпоинт: {Path(ckpt).name}")
+        print(f"  чекпоинт: {Path(ckpt).name}, L={L}, T={T}")
 
-        # Собираем модель и грузим веса. Компилируем с norm_penalty=True,
-        # чтобы список потерь совпал с тем, с каким модель обучалась
-        # (у pinn_free.py по умолчанию norm_penalty=False -- попробуем
-        # оба варианта).
-        for norm_flag in (True, False):
-            try:
-                model = build_fn(norm_penalty=norm_flag)
-                compile_fn(model, "adam", norm_penalty=norm_flag)
-                break
-            except TypeError:
-                # модель не принимает norm_penalty (pinn_free.py) --
-                # фолбэк на вариант по умолчанию
-                model = build_fn()
-                compile_fn(model, "adam")
-                break
-
+        model = _build_and_compile(build_fn, compile_fn)
         _load_weights(model, ckpt)
 
         ts = np.linspace(0.0, T, n_t)
@@ -189,7 +148,7 @@ def main():
     sep = "|---|---|---|"
     print(header)
     print(sep)
-    md_lines += ["", header, sep]
+    md_lines += ["", "## Сводка", "", header, sep]
 
     all_passed = True
     for name, max_dev, passed, _, _ in results:
@@ -200,19 +159,16 @@ def main():
         if not passed:
             all_passed = False
 
-    # ---------- Таблица norm vs t ----------
-    md_lines += ["", "## Норма по времени", ""]
-    t_header = "| t | " + " | ".join(n for n, *_ in results) + " |"
-    t_sep = "|---|" + "---|" * len(results)
-    md_lines += [t_header, t_sep]
-
-    ts_all = results[0][3]  # предполагаем, что у всех моделей одна сетка t
-    # Если T разные -- выровняем по индексу
-    for i, t in enumerate(ts_all):
-        vals = " | ".join(
-            f"{norms[i]:.4f}" for _, _, _, _, norms in results
-        )
-        md_lines.append(f"| {t:.2f} | {vals} |")
+    # ---------- Норма по времени: отдельная таблица для каждой модели ----------
+    # ВАЖНО: у разных тестов разные T (5, 8, 8, 10), поэтому общая
+    # таблица с одним столбцом t была бы некорректна: t-сетки у моделей
+    # не совпадают. Показываем каждую модель на её собственной сетке.
+    md_lines += ["", "## Норма по времени (по моделям)", ""]
+    for name, _, _, ts, norms in results:
+        md_lines += [f"### {name}", "", "| t | norm |", "|---|---|"]
+        for t, nm in zip(ts, norms):
+            md_lines.append(f"| {t:.2f} | {nm:.6f} |")
+        md_lines.append("")
 
     print()
     print("РЕЗУЛЬТАТ: " +
