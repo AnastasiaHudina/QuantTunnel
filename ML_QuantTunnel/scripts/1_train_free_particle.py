@@ -42,7 +42,10 @@ import numpy as np
 
 # np.trapezoid появился в NumPy 2.0 (переименование np.trapz). Поддерживаем
 # обе версии NumPy.
-_trapz = getattr(np, "trapezoid", np.trapz)
+try:
+    _trapz = np.trapezoid
+except AttributeError:
+    _trapz = np.trapz
 
 import deepxde as dde
 
