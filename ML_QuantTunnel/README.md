@@ -5,10 +5,12 @@
 ## Структура
 ```
 ML_QuantTunnel/
-├── configs/    генератор физических конфигураций
-├── docs/       документация и пояснения
-├── physics/    физический модуль
-└── scripts/    скрипты проверки физики
+├── checkpoints/ веса обученных моделей (не в git, см. .gitignore)
+├── configs/     генератор физических конфигураций
+├── docs/        документация и пояснения
+├── model/       PINN-модели на DeepXDE
+├── physics/     физический модуль
+└── scripts/     обучение и проверки
 ```
 
 
@@ -27,10 +29,27 @@ ML_QuantTunnel/
 **`configs/`** — генератор конфигураций:
 - `generator.py` — генерация наборов (W, d, ε, b), разбиение train/val/test
 
-**`scripts/`** — проверки:
-- `check_physics.py` — единый скрипт проверки физики
+**`model/`** — PINN на DeepXDE (бэкенд PyTorch, `DDE_BACKEND=pytorch`):
+- `pinn_free.py` — Тест 1: PDE/IC/BC для свободного движения (V=0)
 
-## Запуск проверки
+**`scripts/`** — обучение и проверки:
+- `check_physics.py` — единый скрипт проверки физического модуля
+- `train_free_particle.py` — обучение (или дообучение из чекпоинта) модели
+  из `model/pinn_free.py` и проверка по критериям Теста 1 из
+  `docs/validation_plan.md`
+
+## Запуск проверки физики
 
 ```bash
 python scripts/check_physics.py
+```
+
+## Обучение PINN (свободное движение)
+
+```bash
+# обучение с нуля
+DDE_BACKEND=pytorch python scripts/train_free_particle.py
+
+# дообучение из чекпоинта + доводка L-BFGS
+DDE_BACKEND=pytorch python scripts/train_free_particle.py \
+    --resume checkpoints/pinn_free-8000.pt --iterations 0 --lbfgs_maxiter 3000
